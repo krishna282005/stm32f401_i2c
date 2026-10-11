@@ -1,6 +1,15 @@
 #include <stdint.h>
 #include "stm32f401.h"
 
+typedef enum
+{
+	I2C_STATE_IDLE,
+	I2C_STATE_MASTER_TX,
+	I2C_STATE_MASTER_RX,
+	I2C_STATE_SLAVE_RX,
+	I2C_STATE_SLAVE_TX
+}i2c_state_t;
+
 #define PE    (1U << 0)
 #define START (1U << 8)
 #define STOP  (1U << 9)
@@ -19,22 +28,40 @@
 
 #define BUSY (1U << 1)
 
+#define ITERREN (1U << 8)
+#define ITEVTEN (1U << 9)
+#define ITBUFEN (1U << 10)
+
 #define I2C_OK       	0
 #define I2C_ERR_BERR 	1
 #define I2C_ERR_ARLO 	2
 #define I2C_ERR_AF      3
 #define I2C_ERR_INVALID 4
+#define I2C_STATE_BUSY  5
 
 void led_on(void);
 void led_off(void);
+void I2C1_EV_IRQHandler(void);
+void I2C1_ER_IRQHandler(void);
+
+volatile uint8_t  i2c_tx_busy;
+volatile uint8_t  i2c_tx_error;
+
+volatile uint8_t *i2c_data;
+
+volatile uint32_t i2c_length;
+volatile uint32_t i2c_index;
+
+volatile uint8_t i2c_address;
+
+volatile i2c_state_t i2c_state = I2C_STATE_IDLE;
 
 void I2C1_init(void)
 {
+
 	RCC->AHB1ENR |=  (1U << 2); //enable GPIOC
 	GPIOC->MODER &= ~(3U << (13*2)); // clean for led
 	GPIOC->MODER |=  (1U << (13*2)); // set as output
-
-
 
 	RCC->APB1ENR |= (1U << 21); //ENABLE clock for i2c1 peripheral
 	RCC->AHB1ENR |= (1U << 1);  //ENABLE clock for GPIOB peripheral
@@ -70,6 +97,13 @@ void I2C1_init(void)
 
 	I2C1->CR1 |= PE; // PE=1
 	I2C1->CR1 |= ACK;
+
+	I2C1->CR2 |= ITERREN | ITEVTEN | ITBUFEN ; // enabling all the interrupts
+
+	NVIC_ISER0 |= (1U << 31);   // i2c IRQ_event, IRQ = 31
+	NVIC_ISER1 |= (1U << 0);    // i2c IRQ_error, IRQ = 32
+
+
 }
 
 uint8_t I2C1_start(void)
@@ -595,7 +629,6 @@ uint8_t I2C1_target_receiver (uint8_t *data, uint32_t length)
     return I2C_OK;
 }
 
-
 void led_on(void)
 {
 	GPIOC->BSRR = (1U << 29); // LED ON when RESET
@@ -604,4 +637,213 @@ void led_on(void)
 void led_off(void)
 {
 	GPIOC->BSRR = (1U << 13); //LED OFF when SET
+}
+
+//----------------------------------------------------------------------------------------------//
+//---------------------------------------Interrupts---------------------------------------------//
+//----------------------------------------------------------------------------------------------//
+
+
+uint8_t I2C1_write_it(uint8_t address, uint8_t *data, uint32_t length)
+{
+	if (I2C1->SR2 & BUSY)
+		return I2C_STATE_BUSY;
+
+	if (length == 0)
+		return I2C_ERR_INVALID;
+
+	if (data == (void*)0)
+		return I2C_ERR_INVALID;
+
+	if (i2c_state != I2C_STATE_IDLE)
+	    return I2C_STATE_BUSY;
+
+	if (I2C1->SR2 & BUSY)
+	    return I2C_STATE_BUSY;
+
+	i2c_state = I2C_STATE_MASTER_TX;
+
+	i2c_address = address;
+	i2c_length = length;
+	i2c_index = 0;
+
+	i2c_data = data;
+
+	I2C1->CR1 |= START;
+
+	return I2C_OK;
+
+}
+
+uint8_t I2C1_read_it(uint8_t address, uint8_t *data, uint32_t length)
+{
+	if (I2C1->SR2 & BUSY)
+		return I2C_STATE_BUSY;
+
+	if (length == 0)
+		return I2C_ERR_INVALID;
+
+	if (data == (void*)0)
+		return I2C_ERR_INVALID;
+
+	if (i2c_state != I2C_STATE_IDLE)
+	    return I2C_STATE_BUSY;
+
+	if (I2C1->SR2 & BUSY)
+	    return I2C_STATE_BUSY;
+
+	i2c_state = I2C_STATE_MASTER_RX;
+
+	i2c_address = address;
+	i2c_length = length;
+	i2c_data = data;
+	i2c_index = 0;
+
+	I2C1->CR1 |= START;
+
+	return I2C_OK;
+}
+
+void I2C1_EV_IRQHandler(void)
+{
+    if (I2C1->SR1 & SB)  // handle START bit detection
+    {
+    	(void)I2C1->SR1;
+    	if (i2c_state == I2C_STATE_MASTER_TX)
+    		I2C1->DR = (i2c_address << 1)|0;
+    	if (i2c_state == I2C_STATE_MASTER_RX)
+    		I2C1->DR = (i2c_address << 1)|1;
+    }
+    if (I2C1->SR1 & ADDR)  // handle after address read/write
+    {
+    	if (i2c_state == I2C_STATE_MASTER_TX)
+    	{
+        	(void)I2C1->SR1;
+        	(void)I2C1->SR2;
+    		I2C1->DR = *i2c_data;
+    		i2c_index++;
+    	}
+    	if (i2c_state == I2C_STATE_MASTER_RX)
+    	{
+    		if (i2c_length == 1)
+    		{
+    			I2C1->CR1 &= ~ACK; // disabling the ACK
+    	    	(void)I2C1->SR1;
+    	    	(void)I2C1->SR2;
+    			I2C1->CR1 |= STOP;  //prepare for stop condition
+    		}
+    		else if (i2c_length == 2)
+    		{
+    			I2C1->CR1 &= ~ACK;
+    			I2C1->CR1 |= POS;
+    	    	(void)I2C1->SR1;
+    	    	(void)I2C1->SR2;
+    		}
+    		else
+    		{
+    			// do nothing for N byte receiving just clear ADDR
+    	    	(void)I2C1->SR1;
+    	    	(void)I2C1->SR2;
+    		}
+    	}
+    }
+
+    if (I2C1->SR1 & RXNE)  // handle RX buffer full
+    {
+    	if (i2c_state == I2C_STATE_MASTER_RX)
+    	{
+			if (i2c_index < i2c_length)
+			{
+				if (i2c_length == 1)
+				{
+					*i2c_data = I2C1->DR;
+					i2c_index++;
+					I2C1->CR1 |= ACK;
+					I2C1->CR1 &= ~POS;
+					i2c_state = I2C_STATE_IDLE;
+				}
+				else if (i2c_length == 2)
+				{
+					//Do nothing
+				}
+				else
+				{
+					if (!(I2C1->SR1 & BTF) && (i2c_index < i2c_length))
+					{
+						i2c_data[i2c_index] = I2C1->DR;
+						i2c_index++;
+					}
+				}
+			}
+    	}
+    }
+
+    if (I2C1->SR1 & BTF)  // handle RX buffer full
+    	{
+        	if (i2c_state == I2C_STATE_MASTER_RX)
+        	{
+        		if (i2c_length == 1)
+        		{
+        			//do nothing
+        		}
+        		else if (i2c_length == 2)
+        		{
+        			I2C1->CR1 |= STOP;
+					i2c_data[i2c_index] = I2C1->DR;
+					i2c_index++;
+					i2c_data[i2c_index] = I2C1->DR;
+					i2c_index++;
+					I2C1->CR1 |= ACK;
+					I2C1->CR1 &= ~POS;
+					i2c_state = I2C_STATE_IDLE;
+        		}
+        		else
+        		{
+        			if (i2c_index == i2c_length - 3)
+        			{
+        				I2C1->CR1 &= ~ACK;
+						i2c_data[i2c_index] = I2C1->DR;
+						i2c_index++;
+        			}
+        			else if (i2c_index > i2c_length - 3)
+        			{
+        				I2C1->CR1 |= STOP;
+						i2c_data[i2c_index] = I2C1->DR;
+						i2c_index++;
+						i2c_data[i2c_index] = I2C1->DR;
+						i2c_index++;
+
+					    I2C1->CR1 |= ACK;
+					    I2C1->CR1 &= ~POS;
+						i2c_state = I2C_STATE_IDLE;
+        			}
+        		}
+        	}
+        }
+
+
+    if (I2C1->SR1 & TXE)  // handle TX buffer empty
+    {
+    	if (i2c_state == I2C_STATE_MASTER_TX)
+    	{
+        	if (i2c_index < i2c_length)
+        	{
+        		I2C1->DR = i2c_data[i2c_index];
+        		i2c_index++;
+        	}
+    	}
+    }
+    if ((I2C1->SR1 & BTF) && (I2C1->SR1 & TXE))
+    {
+    	if (i2c_state == I2C_STATE_MASTER_TX)
+    	{
+    		I2C1->CR1 |= STOP;
+    		i2c_state = I2C_STATE_IDLE;
+    	}
+    }
+}
+
+void I2C1_ER_IRQHandler(void)
+{
+    led_on();
 }
